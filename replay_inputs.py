@@ -70,8 +70,8 @@ def load_input_dumps(dump_dir="/home/mtanaka/work/dc/actor_debug/input_dumps", s
     
     return dumps
 
-def replay_single_input(actor, dump_data, device, verbose=True):
-    """Replay a single input dump through the actor"""
+def replay_single_input(actor, dump_data, device, verbose=True, enable_backward=True):
+    """Replay a single input dump through the actor with backward pass"""
     
     if verbose:
         print(f"\n=== Replaying Input ===")
@@ -99,7 +99,7 @@ def replay_single_input(actor, dump_data, device, verbose=True):
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
     
-    # Run forward pass
+    # Run forward and backward pass
     try:
         start_time = torch.cuda.synchronize() if torch.cuda.is_available() else None
         if torch.cuda.is_available():
@@ -108,27 +108,67 @@ def replay_single_input(actor, dump_data, device, verbose=True):
         import time
         cpu_start_time = time.time()
         
-        with torch.no_grad():
-            result = actor(
-                sequences=sequences,
-                action_mask=action_mask,
-                attention_mask=attention_mask,
-                return_output=return_output,
-                allgather_logits=allgather_logits,
-                return_logprobs=return_logprobs,
-                packed_seq_lens=packed_seq_lens,
-                return_entropy=return_entropy,
-            )
+        # Forward pass without no_grad() to enable gradients
+        result = actor(
+            sequences=sequences,
+            action_mask=action_mask,
+            attention_mask=attention_mask,
+            return_output=return_output,
+            allgather_logits=allgather_logits,
+            return_logprobs=return_logprobs,
+            packed_seq_lens=packed_seq_lens,
+            return_entropy=return_entropy,
+        )
+        
+        # Extract action_log_probs for loss computation (actor returns log probs, not logits)
+        if isinstance(result, tuple):
+            action_log_probs = result[0]  # First element is action_log_probs
+            output = result[1] if len(result) > 1 else None
+        else:
+            action_log_probs = result
+            output = None
+            
+        # Conditional backward pass
+        if enable_backward:
+            # Simple loss for backward pass - just use the negative log probability
+            # In real PPO training, this would be computed using PolicyLoss with advantages
+            # Here we just create a dummy loss that's differentiable
+            if action_mask is not None:
+                # Mask the log probs to focus on action tokens only
+                masked_log_probs = action_log_probs * action_mask.float()
+                # Simple loss: negative mean of masked log probabilities
+                loss = -masked_log_probs.sum() / action_mask.sum().clamp(min=1)
+            else:
+                # Fallback: mean of all log probabilities
+                loss = -action_log_probs.mean()
+            
+            # Backward pass
+            backward_start_time = time.time()
+            loss.backward()
+            backward_end_time = time.time()
+            backward_time = backward_end_time - backward_start_time
+        else:
+            # Skip backward pass
+            loss = None
+            backward_time = 0.0
         
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         
         cpu_end_time = time.time()
-        forward_time = cpu_end_time - cpu_start_time
+        total_time = cpu_end_time - cpu_start_time
+        forward_time = total_time - backward_time
         
         if verbose:
             print(f"Forward pass completed successfully!")
             print(f"Forward time: {forward_time:.4f} seconds")
+            if enable_backward:
+                print(f"Backward time: {backward_time:.4f} seconds")
+                print(f"Total time: {total_time:.4f} seconds")
+                print(f"Loss: {loss.item():.6f}")
+            else:
+                print(f"Backward pass: SKIPPED")
+                print(f"Total time: {forward_time:.4f} seconds")
             
             if isinstance(result, tuple):
                 print(f"Result type: tuple with {len(result)} elements")
@@ -146,6 +186,10 @@ def replay_single_input(actor, dump_data, device, verbose=True):
             'success': True,
             'result': result,
             'forward_time': forward_time,
+            'backward_time': backward_time,
+            'total_time': total_time,
+            'loss': loss.item() if loss is not None else None,
+            'enable_backward': enable_backward,
             'input_info': {
                 'batch_size': dump_data.get('batch_size', 'unknown'),
                 'seq_len': dump_data.get('seq_len', 'unknown'),
@@ -187,7 +231,7 @@ def get_rank_info():
     except Exception:
         return 0, 1
 
-def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepcompile=False, compile=False, no_packing=False, zero_stage=1, shuffle_inputs=False, random_seed=None):
+def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepcompile=False, compile=False, no_packing=False, zero_stage=1, shuffle_inputs=False, random_seed=None, enable_backward=True):
     """Replay all available input dumps"""
     
     # Get rank information for multi-GPU setup
@@ -244,17 +288,23 @@ def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepco
     successful_replays = 0
     failed_replays = 0
     total_forward_time = 0
+    total_backward_time = 0
+    total_loss = 0
     
     for i, dump_data in enumerate(dumps):
         if verbose or rank == 0:  # Reduce output spam on non-zero ranks
             print(f"\n--- [Rank {rank}] Input {i+1}/{len(dumps)} ---")
         
-        result = replay_single_input(actor, dump_data, device, verbose=(verbose and rank == 0))
+        result = replay_single_input(actor, dump_data, device, verbose=(verbose and rank == 0), enable_backward=enable_backward)
         results.append(result)
         
         if result['success']:
             successful_replays += 1
             total_forward_time += result['forward_time']
+            total_backward_time += result.get('backward_time', 0)
+            loss_value = result.get('loss', 0)
+            if loss_value is not None:
+                total_loss += loss_value
         else:
             failed_replays += 1
             # Always print errors regardless of rank
@@ -270,6 +320,17 @@ def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepco
         avg_forward_time = total_forward_time / successful_replays
         print(f"Average forward time: {avg_forward_time:.4f} seconds")
         print(f"Total forward time: {total_forward_time:.4f} seconds")
+        
+        if enable_backward:
+            avg_backward_time = total_backward_time / successful_replays
+            avg_loss = total_loss / successful_replays
+            print(f"Average backward time: {avg_backward_time:.4f} seconds")
+            print(f"Average loss: {avg_loss:.6f}")
+            print(f"Total backward time: {total_backward_time:.4f} seconds")
+        else:
+            print("Backward pass: DISABLED")
+            avg_backward_time = 0
+            avg_loss = 0
     
     # Save results (only rank 0 saves to avoid conflicts)
     if rank == 0:
@@ -286,7 +347,10 @@ def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepco
                         'successful': successful_replays,
                         'failed': failed_replays,
                         'avg_forward_time': avg_forward_time if successful_replays > 0 else 0,
+                        'avg_backward_time': avg_backward_time if successful_replays > 0 else 0,
+                        'avg_loss': avg_loss if successful_replays > 0 else 0,
                         'total_forward_time': total_forward_time,
+                        'total_backward_time': total_backward_time,
                     },
                     'timestamp': datetime.now().isoformat()
                 }, f)
@@ -296,73 +360,9 @@ def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepco
     
     return successful_replays > 0
 
-def replay_specific_input(input_file, no_flash_attn=False, deepcompile=False, compile=False, no_packing=False, zero_stage=1):
-    """Replay a specific input dump file"""
-    
-    rank, world_size = get_rank_info()
-    
-    print(f"=== [Rank {rank}] Replaying Specific Input: {input_file} ===")
-    
-    # Initialize actor
-    print(f"[Rank {rank}] Initializing actor...")
-    try:
-        # Import init_actor_only temporarily to create args with options
-        import sys
-        import importlib.util
-        # spec = importlib.util.spec_from_file_location("init_actor_only", "init_actor_only.py")
-        spec = importlib.util.spec_from_file_location("init_actor_no_ds", "init_actor_no_ds.py")
-        init_module = importlib.util.module_from_spec(spec)
-        
-        # Temporarily modify sys.argv to pass our options
-        original_argv = sys.argv.copy()
-        sys.argv = ['replay_inputs.py']
-        if no_flash_attn:
-            sys.argv.append('--no-flash-attn')
-        if deepcompile:
-            sys.argv.append('--deepcompile')
-        if compile:
-            sys.argv.append('--compile')
-        if no_packing:
-            sys.argv.append('--no-packing')
-        if zero_stage != 1:  # Only add if different from default
-            sys.argv.extend(['--zero-stage', str(zero_stage)])
-        
-        try:
-            spec.loader.exec_module(init_module)
-            components = init_module.init_actor_standalone()
-        finally:
-            # Restore original argv
-            sys.argv = original_argv
-            
-        actor = components['actor']
-        device = torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'
-        print(f"[Rank {rank}] Actor initialized successfully on device: {device}")
-    except Exception as e:
-        print(f"[Rank {rank}] Failed to initialize actor: {e}")
-        return False
-    
-    # Load specific input
-    try:
-        with open(input_file, 'rb') as f:
-            dump_data = pickle.load(f)
-            dump_data['source_file'] = input_file
-    except Exception as e:
-        print(f"Error loading input file {input_file}: {e}")
-        return False
-    
-    # Replay the input
-    result = replay_single_input(actor, dump_data, device, verbose=True)
-    
-    if result['success']:
-        print("\nReplay completed successfully!")
-        return True
-    else:
-        print(f"\nReplay failed: {result['error']}")
-        return False
 
 def main():
     parser = argparse.ArgumentParser(description="Replay actor inputs for debugging")
-    parser.add_argument('--input-file', type=str, help="Specific input file to replay")
     parser.add_argument('--max-inputs', type=int, help="Maximum number of inputs to replay")
     parser.add_argument('--quiet', action='store_true', help="Reduce verbose output")
     parser.add_argument('--local_rank', type=int, default=-1, help="Local rank for DeepSpeed launcher")
@@ -377,28 +377,27 @@ def main():
                        help="Randomly shuffle inputs differently per rank to create sequence length mismatches (triggers padding)")
     parser.add_argument('--random-seed', type=int, default=42,
                        help="Base random seed for shuffling (each rank gets seed + rank)")
+    parser.add_argument('--no-backward', action='store_true',
+                       help="Skip backward pass (only run forward pass)")
     
     args = parser.parse_args()
     
     verbose = not args.quiet
     
-    if args.input_file:
-        if not os.path.exists(args.input_file):
-            print(f"Input file not found: {args.input_file}")
-            sys.exit(1)
-        success = replay_specific_input(args.input_file, no_flash_attn=args.no_flash_attn, deepcompile=args.deepcompile, compile=args.compile, no_packing=args.no_packing, zero_stage=args.zero_stage, local_rank=args.local_rank)
-    else:
-        success = replay_all_inputs(
-            max_inputs=args.max_inputs, 
-            verbose=verbose, 
-            no_flash_attn=args.no_flash_attn, 
-            deepcompile=args.deepcompile, 
-            compile=args.compile, 
-            no_packing=args.no_packing,
-            zero_stage=args.zero_stage,
-            shuffle_inputs=args.shuffle_inputs,
-            random_seed=args.random_seed
-        )
+    enable_backward = not args.no_backward
+    
+    success = replay_all_inputs(
+        max_inputs=args.max_inputs, 
+        verbose=verbose, 
+        no_flash_attn=args.no_flash_attn, 
+        deepcompile=args.deepcompile, 
+        compile=args.compile, 
+        no_packing=args.no_packing,
+        zero_stage=args.zero_stage,
+        shuffle_inputs=args.shuffle_inputs,
+        random_seed=args.random_seed,
+        enable_backward=enable_backward
+    )
     
     if success:
         print("\nReplay session completed successfully!")
