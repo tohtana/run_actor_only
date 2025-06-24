@@ -1,381 +1,193 @@
-# Actor Debug Setup
+# Actor Debug Environment
 
-This directory contains tools for debugging the OpenRLHF actor module in isolation.
+This directory provides an isolated debugging environment for the OpenRLHF actor module, focused on replaying real training inputs to debug compilation and performance issues.
 
-## Overview
+## Core Components
 
-The setup allows you to:
-1. **Initialize only the actor module** without the full RLHF training setup
-2. **Dump actor inputs** during real training runs
-3. **Replay dumped inputs** to the actor for debugging
+The primary debugging workflow centers around two key scripts:
 
-## Directory Structure
+### **`replay_inputs.py`** - Main debugging script
+Replays captured training inputs through a standalone actor instance with comprehensive testing options including forward/backward passes, compilation modes, layer count modification, and multi-GPU simulation.
 
-```
-actor_debug/
-├── README.md                    # This file
-├── init_actor_only.py          # Initialize actor standalone
-├── enable_input_dumping.py     # Setup input dumping capability
-├── control_dumping.py          # Enable/disable input dumping
-├── replay_inputs.py            # Replay dumped inputs to actor
-├── setup_debug.sh              # Quick setup script
-├── create_dummy_input.py       # Create dummy inputs for testing
-├── actor_original_backup.py    # Backup of original actor.py
-├── dumping_enabled.flag        # Flag file indicating dumping is enabled
-├── input_dumps/                # Directory where inputs are saved (1025+ files!)
-├── logs/                       # Directory for debug logs
-├── checkpoints/               # Directory for actor checkpoints
-└── saved_model/               # Directory for saved models
-```
-
-## Quick Start
-
-### 1. Setup the Debug Environment
+### **`init_actor_only.py`** - Actor initialization dependency  
+Provides standalone actor initialization without Ray dependencies, supporting various configurations like custom layer counts, compilation modes, and DeepSpeed integration.
 
 ```bash
-cd /home/mtanaka/work/dc/actor_debug
-./setup_debug.sh
-```
-
-This will:
-- Backup the original `actor.py` file
-- Modify `actor.py` to support input dumping
-- Create control scripts
-- Test actor initialization
-
-### 2. Test Actor Initialization
-
-```bash
-# Basic initialization
-deepspeed --num_gpus=1 init_actor_only.py
-
-# With DeepCompile enabled (slow compilation)
-deepspeed --num_gpus=1 init_actor_only.py --deepcompile
-
-# With PyTorch compilation enabled (without DeepCompile)
-deepspeed --num_gpus=1 init_actor_only.py --compile
-
-# With Flash Attention disabled
-deepspeed --num_gpus=1 init_actor_only.py --no-flash-attn
-
-# DeepCompile without Flash Attention (avoids known error)
-deepspeed --num_gpus=1 init_actor_only.py --deepcompile --no-flash-attn
-
-# PyTorch compilation without Flash Attention
-deepspeed --num_gpus=1 init_actor_only.py --compile --no-flash-attn
-
-# PyTorch compilation with Flash Attention (no packing - uses flash_attn_func)
-deepspeed --num_gpus=1 init_actor_only.py --compile --no-packing
-```
-
-This will:
-- Initialize the actor model standalone with DeepSpeed
-- Test a forward pass with CUDA and Flash Attention
-- Save the initialized components
-- Warn about problematic DeepCompile + Flash Attention + Packing Samples combination
-
-### 3. Enable Input Dumping (Optional - Already Done)
-
-```bash
-python control_dumping.py enable
-```
-
-**Note**: Input dumping is already enabled and 1025+ real training inputs have been collected.
-
-### 4. Run Training to Collect More Inputs (Optional)
-
-```bash
-cd /home/mtanaka/work/dc/run
-./run.sh start
-```
-
-During training, actor inputs will be automatically saved to `actor_debug/input_dumps/`.
-
-### 5. Replay Inputs for Debugging
-
-```bash
-# Replay first 5 collected inputs
+# Basic replay of first 5 inputs with backward pass
 deepspeed --num_gpus=1 replay_inputs.py --max-inputs 5
 
-# Replay with PyTorch compilation (without DeepCompile)
-deepspeed --num_gpus=1 replay_inputs.py --compile --max-inputs 5
-
-# Replay with DeepSpeed DeepCompile
-deepspeed --num_gpus=1 replay_inputs.py --deepcompile --max-inputs 5
-
-# Replay all collected inputs (1025+ files!)
-deepspeed --num_gpus=1 replay_inputs.py
-
-# Replay specific input file
-deepspeed --num_gpus=1 replay_inputs.py --input-file input_dumps/actor_inputs_rank0_20250619_052608_430740.pkl
-
-# Quiet mode (less verbose output)
-deepspeed --num_gpus=1 replay_inputs.py --max-inputs 10 --quiet
-
-# PyTorch compilation without Flash Attention (safer)
+# Test compilation modes (Flash Attention compatibility)
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
 deepspeed --num_gpus=1 replay_inputs.py --compile --no-flash-attn --max-inputs 5
 
-# PyTorch compilation with Flash Attention (no packing - should work)
-deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
+# Test with reduced model size for memory optimization
+deepspeed --num_gpus=1 replay_inputs.py --num-layers 2 --max-inputs 5
+
+# Multi-GPU padding simulation with shuffled inputs
+deepspeed --num_gpus=1 replay_inputs.py --shuffle-inputs --max-inputs 10
 ```
 
-## Detailed Usage
+### Core Replay Options
 
-### Actor Initialization (`init_actor_only.py`)
+```bash
+# Compilation Testing (Flash Attention Compatibility)
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5    # Flash Attention with compilation
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-flash-attn --max-inputs 5 # SDPA fallback 
+deepspeed --num_gpus=1 replay_inputs.py --deepcompile --no-flash-attn --max-inputs 5 # DeepCompile mode
 
-Initializes the actor model with the same configuration as the full training setup but without Ray dependencies.
+# Memory Optimization with Layer Count Reduction  
+deepspeed --num_gpus=1 replay_inputs.py --num-layers 2 --max-inputs 5   # ~8GB instead of ~45GB
+deepspeed --num_gpus=1 replay_inputs.py --num-layers 4 --max-inputs 5   # Medium size model
+deepspeed --num_gpus=1 replay_inputs.py --num-layers 8 --max-inputs 5   # Larger but still reduced
 
-**Features:**
-- Uses same model configuration as `run.sh`
-- Supports DeepSpeed integration with CUDA
-- Tests forward pass functionality with Flash Attention
-- Saves initialized state for reuse
-- **Requires DeepSpeed launcher**: `deepspeed --num_gpus=1 init_actor_only.py`
+# DeepSpeed ZeRO Stage Testing
+deepspeed --num_gpus=1 replay_inputs.py --zero-stage 0 --max-inputs 5   # No optimization (baseline)
+deepspeed --num_gpus=1 replay_inputs.py --zero-stage 2 --max-inputs 5   # Optimizer + gradient partitioning
+deepspeed --num_gpus=1 replay_inputs.py --zero-stage 3 --max-inputs 5   # Full partitioning
+
+# Multi-GPU Simulation and Padding Issues
+deepspeed --num_gpus=1 replay_inputs.py --shuffle-inputs --max-inputs 10   # Creates sequence length mismatches
+deepspeed --num_gpus=1 replay_inputs.py --shuffle-inputs --random-seed 123 --max-inputs 10
+
+# Forward-Only Testing (Skip Backward Pass)
+deepspeed --num_gpus=1 replay_inputs.py --no-backward --max-inputs 5
+deepspeed --num_gpus=1 replay_inputs.py --no-backward --compile --no-packing --max-inputs 5
+
+# Process All Available Inputs (1000+ files)
+deepspeed --num_gpus=1 replay_inputs.py --quiet   # All inputs, minimal output
+```
+
+## Key Features
+
+### **Input Replay (`replay_inputs.py`)**
+
+The main debugging script with comprehensive options:
+
+**Core Capabilities:**
+- **1000+ Real Training Inputs**: Pre-collected inputs from actual training runs ready for replay
+- **Forward + Backward Pass**: Full gradient computation with configurable loss functions  
+- **Compilation Testing**: PyTorch compile and DeepSpeed DeepCompile with Flash Attention compatibility
+- **Memory Optimization**: Custom layer counts to reduce model size from 8B to ~1.5B parameters
+- **Multi-GPU Simulation**: Shuffled inputs create sequence length mismatches to test padding behavior
+- **Performance Measurement**: Detailed timing for forward/backward passes and memory usage
+
+**Key Arguments:**
+- `--max-inputs N`: Limit number of inputs to replay (useful for quick testing)
+- `--num-layers N`: Custom layer count (2 layers = ~8GB instead of ~45GB memory)
+- `--compile`: Enable PyTorch compilation (use with `--no-packing` for Flash Attention)
+- `--no-flash-attn`: Use SDPA instead of Flash Attention (compilation-safe fallback)
+- `--shuffle-inputs`: Create sequence length mismatches across ranks (tests padding)
+- `--no-backward`: Skip backward pass for forward-only testing
+- `--zero-stage [0-3]`: Test different DeepSpeed ZeRO optimization levels
+
+### **Actor Initialization (`init_actor_only.py`)**
+
+Dependency script that provides standalone actor initialization:
 
 **Configuration:**
-The script uses hardcoded configuration matching the `run.sh` parameters:
-- Model: `meta-llama/Llama-3.1-8B-Instruct` (8B parameters)
-- Zero Stage: 1
-- Flash Attention: Enabled (CUDA only)
-- BF16: Enabled
-- Packing samples: Enabled
-
-### Input Dumping Setup (`enable_input_dumping.py`)
-
-Modifies the OpenRLHF actor to support input dumping during training.
-
-**What it does:**
-1. Creates backup of original `actor.py`
-2. Patches `actor.py` to add dumping capability
-3. Creates control script for enabling/disabling dumps
-
-**Safety:**
-- Always creates backup before modification
-- Can restore original file if needed
-- Dumping is disabled by default
-
-### Dumping Control (`control_dumping.py`)
-
-Controls whether input dumping is active during training.
-
-```bash
-# Enable dumping
-python control_dumping.py enable
-
-# Disable dumping  
-python control_dumping.py disable
-```
-
-**How it works:**
-- Creates/removes a flag file (`dumping_enabled.flag`)
-- Actor checks for this flag during initialization
-- No restart required when enabling/disabling
-
-### Input Replay (`replay_inputs.py`)
-
-Replays saved inputs through a standalone actor instance.
-
-**Features:**
-- Loads and replays all or specific input dumps
-- Measures forward pass timing
-- Handles multi-process dumps (different ranks)
-- Saves detailed results
-- Supports verbose and quiet modes
-- **Requires DeepSpeed launcher**: `deepspeed --num_gpus=1 replay_inputs.py`
-
-**Current Status**: 1025+ real training input files available for replay!
-
-**Usage examples:**
-```bash
-# Basic replay (first few inputs)
-deepspeed --num_gpus=1 replay_inputs.py --max-inputs 5
-
-# With PyTorch compilation (without DeepCompile)
-deepspeed --num_gpus=1 replay_inputs.py --compile --max-inputs 5
-
-# With DeepSpeed DeepCompile
-deepspeed --num_gpus=1 replay_inputs.py --deepcompile --max-inputs 5
-
-# Quiet mode
-deepspeed --num_gpus=1 replay_inputs.py --max-inputs 10 --quiet
-
-# Replay all collected inputs (1025+ files!)
-deepspeed --num_gpus=1 replay_inputs.py
-
-# Replay specific file
-deepspeed --num_gpus=1 replay_inputs.py --input-file input_dumps/actor_inputs_rank0_20250619_052608_430740.pkl
-
-# PyTorch compilation without Flash Attention (safer)
-deepspeed --num_gpus=1 replay_inputs.py --compile --no-flash-attn --max-inputs 5
-
-# PyTorch compilation with Flash Attention (no packing - should work)
-deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
-```
-
-## Input Dump Format
-
-Each dumped input file contains:
-```python
-{
-    'sequences': torch.Tensor,           # Input token sequences
-    'action_mask': torch.Tensor,         # Action mask for RL
-    'attention_mask': torch.Tensor,      # Attention mask
-    'return_output': bool,               # Whether to return full output
-    'allgather_logits': bool,           # Whether to allgather logits
-    'return_logprobs': bool,            # Whether to return log probs
-    'packed_seq_lens': list,            # Packed sequence lengths
-    'return_entropy': bool,             # Whether to return entropy
-    'timestamp': str,                   # When input was captured
-    'rank': int,                       # Process rank
-    'batch_size': int,                 # Batch size
-    'seq_len': int,                    # Sequence length
-}
-```
+- Model: `meta-llama/Llama-3.1-8B-Instruct` 
+- DeepSpeed ZeRO Stage 1 (configurable)
+- Flash Attention enabled (CUDA only)
+- BF16 precision enabled
+- Custom layer count support via monkey patching
 
 ## Debugging Workflow
 
-1. **Setup**: Run `./setup_debug.sh` once to setup dumping capability
+### **Primary Workflow (Recommended)**
 
-2. **Debug with Existing Data** (Recommended - 1025+ inputs available):
-   - Initialize standalone actor: `deepspeed --num_gpus=1 init_actor_only.py`
-   - Replay inputs: `deepspeed --num_gpus=1 replay_inputs.py --max-inputs 5`
-   - Analyze results in `logs/` directory
+**1000+ real training inputs are already available** - no setup needed:
 
-3. **Collect More Data** (Optional): 
-   - Enable dumping: `python control_dumping.py enable`
-   - Run training: `cd /home/mtanaka/work/dc/run && ./run.sh start`
-   - Let it run for a few iterations to collect inputs
-   - Stop training and disable dumping: `python control_dumping.py disable`
+```bash
+# Start with basic replay to verify functionality 
+deepspeed --num_gpus=1 replay_inputs.py --max-inputs 5
 
-4. **Iterate**:
-   - Modify actor code as needed
-   - Re-run replay to test changes with: `deepspeed --num_gpus=1 replay_inputs.py --max-inputs 10`
-   - Collect more data if needed
+# Test compilation issues with Flash Attention
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-flash-attn --max-inputs 5
+
+# Test memory optimization with reduced model size
+deepspeed --num_gpus=1 replay_inputs.py --num-layers 2 --max-inputs 5
+
+# Analyze results in logs/ directory
+```
+
+### **Advanced Debugging Scenarios**
+
+```bash
+# Multi-GPU padding issues reproduction
+deepspeed --num_gpus=1 replay_inputs.py --shuffle-inputs --max-inputs 10
+
+# DeepSpeed ZeRO stage comparison
+deepspeed --num_gpus=1 replay_inputs.py --zero-stage 0 --max-inputs 5  # Baseline
+deepspeed --num_gpus=1 replay_inputs.py --zero-stage 3 --max-inputs 5  # Full optimization
+
+# Forward-only performance testing
+deepspeed --num_gpus=1 replay_inputs.py --no-backward --compile --max-inputs 10
+
+# Process all available inputs for comprehensive testing
+deepspeed --num_gpus=1 replay_inputs.py --quiet
+```
 
 ## Troubleshooting
 
-### Actor initialization fails
-- **Use DeepSpeed launcher**: `deepspeed --num_gpus=1 init_actor_only.py`
-- Check CUDA availability and memory (needs ~45GB GPU memory)
-- Verify model path is accessible
-- Ensure DeepSpeed is properly installed
+### Common Issues
 
-### Replay fails with arguments error
-- **Use DeepSpeed launcher**: `deepspeed --num_gpus=1 replay_inputs.py`
+**GPU Memory Errors**
+- Use `--num-layers 2` to reduce memory from ~45GB to ~8GB
+- Try `--zero-stage 3` for maximum memory optimization
+- Start with `--max-inputs 1` for minimal memory testing
+
+**Compilation Failures with Flash Attention**
+- Use `--compile --no-packing` (enables compilation-compatible flash_attn_func)
+- Use `--compile --no-flash-attn` (falls back to SDPA)
+- Avoid `--compile` with default packing (known incompatibility)
+
+**DeepSpeed Launcher Required**
+- Always use: `deepspeed --num_gpus=1 replay_inputs.py`
 - The `--local_rank=0` argument is automatically added by DeepSpeed
+- Direct Python execution will fail with communication backend errors
 
-### No input dumps collected
-- Verify dumping is enabled: `ls dumping_enabled.flag`
-- Check training actually started actor forward passes
-- Look for error messages in training logs
-- **Note**: 1025+ input files are already available!
+## Flash Attention + Compilation Analysis
 
-### Replay fails with CUDA errors
-- Check GPU memory availability (needs ~45-75GB)
-- Try reducing number of inputs: `--max-inputs 1`
-- Ensure consistent CUDA setup between dump and replay
+### **Root Cause: Function Path Incompatibility**
 
-### Input dumps too large
-- Dumps are saved to disk, ensure sufficient space
-- Consider limiting number of dumps collected
-- Clean up old dumps regularly: `rm input_dumps/older_files*.pkl`
+OpenRLHF's packing approach uses `flash_attn_varlen_func` which fails compilation due to FakeTensor handling in C++ bindings.
 
-## Flash Attention + Compilation Investigation
+**Solutions tested in this environment:**
+- `--compile --no-packing`: Uses compilation-compatible `flash_attn_func` 
+- `--compile --no-flash-attn`: Falls back to SDPA (always works)
+- `--deepcompile --no-flash-attn`: DeepSpeed DeepCompile with SDPA
 
-### **Root Cause Analysis**
+### **Verified Working Configurations**
+```bash
+# Flash Attention + Compilation (no packing required)
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
 
-The compilation error with Flash Attention occurs due to **different flash attention functions being used**:
+# SDPA Fallback (most reliable)  
+deepspeed --num_gpus=1 replay_inputs.py --compile --no-flash-attn --max-inputs 5
 
-#### **Standard HuggingFace Models (✅ Compilation Compatible)**
-- Uses: `flash_attn_func` for regular, unpacked sequences
-- Compatible with PyTorch compilation and torch.dynamo tracing
-
-#### **OpenRLHF with Packing (❌ Compilation Incompatible)**  
-- Uses: `flash_attn_varlen_func` for variable-length, packed sequences
-- **NOT** compatible with compilation due to FakeTensor handling issues
-
-### **The Specific Error**
-```
-TorchRuntimeError: flash_attn::_flash_attn_varlen_forward() Expected a value of type 'int' 
-for argument 'max_seqlen_q' but instead found type 'FakeTensor'
+# DeepCompile mode
+deepspeed --num_gpus=1 replay_inputs.py --deepcompile --no-flash-attn --max-inputs 5
 ```
 
-This occurs because:
-1. OpenRLHF uses `packing_samples=True` by default for efficiency
-2. Packed sequences require attention masks and variable lengths  
-3. This forces the use of `flash_attn_varlen_func`
-4. The varlen function expects concrete `int` values for `max_seqlen_q/k`
-5. During compilation, torch.dynamo passes `FakeTensor` objects instead
-6. The C++ binding fails to convert `FakeTensor` to `int`
+## Technical Details
 
-### **Solutions**
+**Memory Usage:**
+- Full model (32 layers): ~45-75GB GPU memory
+- Reduced model (2 layers): ~8GB GPU memory (0.19x reduction)
+- Parameter reduction: 8B → 1.5B parameters
 
-1. **Disable packing** (enables `flash_attn_func`):
-   ```bash
-   deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
-   ```
+**Available Data:** 
+- 1000+ real training input files from actual OpenRLHF runs
+- Multi-rank inputs supporting distributed training simulation
+- Comprehensive metadata including timestamps, batch sizes, sequence lengths
 
-2. **Disable Flash Attention** (uses SDPA instead):
-   ```bash
-   deepspeed --num_gpus=1 replay_inputs.py --compile --no-flash-attn --max-inputs 5
-   ```
+**DeepSpeed Integration:**
+- All ZeRO stages (0-3) supported and tested
+- Proper collective communication backend initialization
+- Multi-GPU simulation via input shuffling
 
-3. **Use separate compilation mode** (PyTorch only, not DeepCompile):
-   ```bash
-   deepspeed --num_gpus=1 replay_inputs.py --compile --no-packing --max-inputs 5
-   ```
-
-### **Function Path Analysis**
-
-**In `transformers/integrations/flash_attention.py`:**
-
-```python
-# OpenRLHF path (packing_samples=True) - FAILS with compilation
-if attention_mask is not None:
-    attn_output = flash_attn_varlen_func(...)  # Uses varlen version
-    
-# Standard HuggingFace path (packing_samples=False) - WORKS with compilation  
-else:
-    attn_output = flash_attn_func(...)  # Uses regular version
-```
-
-**Key insight**: Disabling packing (`--no-packing`) forces the `else` branch, using the compilation-compatible `flash_attn_func`.
-
-## Restoration
-
-To restore original actor.py:
-```python
-python -c "
-import sys
-sys.path.append('/home/mtanaka/work/dc/actor_debug')
-from enable_input_dumping import restore_original_actor
-restore_original_actor()
-"
-```
-
-## Files Generated
-
-- `actor_original_backup.py`: Backup of original actor.py
-- `dumping_enabled.flag`: Flag file to control dumping (✅ enabled)
-- `input_dumps/actor_inputs_*.pkl`: Dumped input files (✅ 1025+ files available)
-- `logs/replay_results_*.pkl`: Replay session results
-- `initialized_actor.pt`: Saved actor initialization state
-- `create_dummy_input.py`: Script to create test inputs
-
-## Current Status
-
-✅ **Setup Complete**: All debugging infrastructure ready  
-✅ **Input Dumping**: Enabled and 1025+ real training inputs collected  
-✅ **Actor Initialization**: Working with DeepSpeed launcher  
-✅ **Input Replay**: Working with DeepSpeed launcher  
-✅ **CUDA Support**: Flash Attention and BF16 enabled  
-
-## Notes
-
-- **All scripts require DeepSpeed launcher**: Use `deepspeed --num_gpus=1 <script>`
-- Input dumping adds minimal overhead during training
-- Dumps are automatically saved with rank and timestamp info
-- Multi-GPU training will generate dumps from all ranks
-- Replay can handle inputs from any rank/configuration
-- All modifications are reversible
-- **Memory Requirements**: ~45-75GB GPU memory for full model
+**Performance Measurement:**
+- Separate forward/backward pass timing
+- CUDA synchronization for accurate measurements  
+- Detailed logging saved to `logs/replay_results_*.pkl`
