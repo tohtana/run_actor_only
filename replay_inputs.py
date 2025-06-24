@@ -231,7 +231,7 @@ def get_rank_info():
     except Exception:
         return 0, 1
 
-def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepcompile=False, compile=False, no_packing=False, zero_stage=1, shuffle_inputs=False, random_seed=None, enable_backward=True):
+def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepcompile=False, compile=False, no_packing=False, zero_stage=1, shuffle_inputs=False, random_seed=None, enable_backward=True, num_layers=0):
     """Replay all available input dumps"""
     
     # Get rank information for multi-GPU setup
@@ -253,7 +253,8 @@ def replay_all_inputs(max_inputs=None, verbose=True, no_flash_attn=False, deepco
             deepcompile=deepcompile, 
             compile=compile, 
             packing=not no_packing, 
-            zero_stage=zero_stage
+            zero_stage=zero_stage,
+            num_layers=num_layers
         )
             
         actor = components['actor']
@@ -379,6 +380,8 @@ def main():
                        help="Base random seed for shuffling (each rank gets seed + rank)")
     parser.add_argument('--no-backward', action='store_true',
                        help="Skip backward pass (only run forward pass)")
+    parser.add_argument('--num-layers', type=int, default=0,
+                       help="Number of transformer layers (0 = use default from model config)")
     
     args = parser.parse_args()
     
@@ -396,7 +399,8 @@ def main():
         zero_stage=args.zero_stage,
         shuffle_inputs=args.shuffle_inputs,
         random_seed=args.random_seed,
-        enable_backward=enable_backward
+        enable_backward=enable_backward,
+        num_layers=args.num_layers
     )
     
     if success:
